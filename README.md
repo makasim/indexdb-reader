@@ -2,6 +2,8 @@
 
 A CLI tool for studying the on-disk format of VictoriaMetrics indexdb.
 
+**Disclaimer:** This project is for learning purposes only. It is kept as simple as possible with no optimizations, does not depend on VictoriaMetrics libraries, and is designed to work only on small parts.
+
 ## Usage
 
 ```
