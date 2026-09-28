@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -53,7 +52,7 @@ func main() {
 	// metaindex.bin is ZSTD-compressed. After decompression it contains
 	// a sequence of metaindex rows packed back-to-back. Each row:
 	//
-	//   encoding.MarshalBytes(firstItem)   — VarUint64(len) + raw bytes
+	//   marshalBytes(firstItem)   — VarUint64(len) + raw bytes
 	//   Uint32(blockHeadersCount)          — big-endian, 4 bytes
 	//   Uint64(indexBlockOffset)           — big-endian, 8 bytes
 	//   Uint32(indexBlockSize)             — big-endian, 4 bytes
@@ -76,7 +75,7 @@ func main() {
 	rowIdx := 0
 	for len(src) > 0 {
 		// Unmarshal firstItem: VarUint64-prefixed byte slice
-		fi, n := encoding.UnmarshalBytes(src)
+		fi, n := unmarshalBytes(src)
 		if n <= 0 {
 			fatalf("metaindex row %d: cannot unmarshal firstItem", rowIdx)
 		}
@@ -106,8 +105,8 @@ func main() {
 		// an index block contains blockHeadersCount block headers packed
 		// back-to-back. Each block header:
 		//
-		//   encoding.MarshalBytes(commonPrefix)  — shared prefix for all items
-		//   encoding.MarshalBytes(firstItem)     — first item in the block
+		//   marshalBytes(commonPrefix)  — shared prefix for all items
+		//   marshalBytes(firstItem)     — first item in the block
 		//   Uint8(marshalType)                   — 0=plain, 1=ZSTD
 		//   Uint32(itemsCount)                   — items EXCLUDING first item
 		//   Uint64(itemsBlockOffset)             — byte offset in items.bin
@@ -129,14 +128,14 @@ func main() {
 		bhSrc := indexBlockDecompressed
 		for bhIdx := 0; bhIdx < int(blockHeadersCount); bhIdx++ {
 			// commonPrefix
-			commonPrefix, n := encoding.UnmarshalBytes(bhSrc)
+			commonPrefix, n := unmarshalBytes(bhSrc)
 			if n <= 0 {
 				fatalf("block header %d: cannot unmarshal commonPrefix", bhIdx)
 			}
 			bhSrc = bhSrc[n:]
 
 			// firstItem
-			bhFirstItem, n := encoding.UnmarshalBytes(bhSrc)
+			bhFirstItem, n := unmarshalBytes(bhSrc)
 			if n <= 0 {
 				fatalf("block header %d: cannot unmarshal firstItem", bhIdx)
 			}
@@ -394,7 +393,7 @@ func unmarshalTag(src []byte) (key, value string, tail []byte, ok bool) {
 }
 
 func unmarshalCompositeKey(src []byte) (name, key string) {
-	nameLen, n := encoding.UnmarshalVarUint64(src)
+	nameLen, n := unmarshalVarUint64(src)
 	if n <= 0 || uint64(n)+nameLen > uint64(len(src)) {
 		return "<bad-composite>", ""
 	}
@@ -551,12 +550,12 @@ func decodeItems(commonPrefix, firstItem []byte, itemsCount uint32, marshalType 
 	} else {
 		// ZSTD: two VarUint64 arrays, XOR-delta encoded.
 		prefixXOR := make([]uint64, count-1)
-		tail, err := encoding.UnmarshalVarUint64s(prefixXOR, lensData)
+		tail, err := unmarshalVarUint64s(prefixXOR, lensData)
 		if err != nil {
 			return nil, fmt.Errorf("unmarshal prefixLens: %w", err)
 		}
 		itemXOR := make([]uint64, count-1)
-		tail, err = encoding.UnmarshalVarUint64s(itemXOR, tail)
+		tail, err = unmarshalVarUint64s(itemXOR, tail)
 		if err != nil {
 			return nil, fmt.Errorf("unmarshal itemLens: %w", err)
 		}
@@ -598,6 +597,141 @@ func decodeItems(commonPrefix, firstItem []byte, itemsCount uint32, marshalType 
 		return nil, fmt.Errorf("unexpected %d trailing bytes in items data", len(b))
 	}
 	return items, nil
+}
+
+// unmarshalVarUint64 returns unmarshaled uint64 from src and its size in bytes.
+//
+// Copied from github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding.
+func unmarshalVarUint64(src []byte) (uint64, int) {
+	if len(src) == 0 {
+		return 0, 0
+	}
+	if src[0] < 0x80 {
+		return uint64(src[0]), 1
+	}
+	if len(src) == 1 {
+		return 0, 0
+	}
+	if src[1] < 0x80 {
+		return uint64(src[0]&0x7f) | uint64(src[1])<<7, 2
+	}
+	return binary.Uvarint(src)
+}
+
+// unmarshalVarUint64s unmarshals len(dst) uint64 values from src and returns the remaining tail.
+//
+// Copied from github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding.
+func unmarshalVarUint64s(dst []uint64, src []byte) ([]byte, error) {
+	if len(src) < len(dst) {
+		return src, fmt.Errorf("too small len(src)=%d; it must be bigger or equal to len(dst)=%d", len(src), len(dst))
+	}
+	for i := range dst {
+		c := src[i]
+		if c >= 0x80 {
+			return unmarshalVarUint64sSlow(dst, src)
+		}
+		dst[i] = uint64(c)
+	}
+	return src[len(dst):], nil
+}
+
+func unmarshalVarUint64sSlow(dst []uint64, src []byte) ([]byte, error) {
+	idx := uint(0)
+	for i := range dst {
+		if idx >= uint(len(src)) {
+			return nil, fmt.Errorf("cannot unmarshal varuint from empty data")
+		}
+		c := src[idx]
+		idx++
+		if c < 0x80 {
+			dst[i] = uint64(c)
+			continue
+		}
+
+		if idx >= uint(len(src)) {
+			return nil, fmt.Errorf("unexpected end of encoded varuint at byte 1; src=%x", src[idx-1:])
+		}
+		d := src[idx]
+		idx++
+		if d < 0x80 {
+			dst[i] = uint64(c&0x7f) | (uint64(d) << 7)
+			continue
+		}
+
+		if idx >= uint(len(src)) {
+			return nil, fmt.Errorf("unexpected end of encoded varuint at byte 2; src=%x", src[idx-2:])
+		}
+		e := src[idx]
+		idx++
+		if e < 0x80 {
+			dst[i] = uint64(c&0x7f) | (uint64(d&0x7f) << 7) | (uint64(e) << (2 * 7))
+			continue
+		}
+
+		u := uint64(c&0x7f) | (uint64(d&0x7f) << 7) | (uint64(e&0x7f) << (2 * 7))
+
+		j := idx
+		for {
+			if idx >= uint(len(src)) {
+				return nil, fmt.Errorf("unexpected end of encoded varint; src=%x", src[j-3:])
+			}
+			c := src[idx]
+			idx++
+			if c < 0x80 {
+				break
+			}
+		}
+
+		switch idx - j {
+		case 1:
+			u |= (uint64(src[j]) << (3 * 7))
+		case 2:
+			b := src[j : j+2 : j+2]
+			u |= (uint64(b[0]&0x7f) << (3 * 7)) | (uint64(b[1]) << (4 * 7))
+		case 3:
+			b := src[j : j+3 : j+3]
+			u |= (uint64(b[0]&0x7f) << (3 * 7)) | (uint64(b[1]&0x7f) << (4 * 7)) | (uint64(b[2]) << (5 * 7))
+		case 4:
+			b := src[j : j+4 : j+4]
+			u |= (uint64(b[0]&0x7f) << (3 * 7)) | (uint64(b[1]&0x7f) << (4 * 7)) | (uint64(b[2]&0x7f) << (5 * 7)) | (uint64(b[3]) << (6 * 7))
+		case 5:
+			b := src[j : j+5 : j+5]
+			u |= (uint64(b[0]&0x7f) << (3 * 7)) | (uint64(b[1]&0x7f) << (4 * 7)) | (uint64(b[2]&0x7f) << (5 * 7)) | (uint64(b[3]&0x7f) << (6 * 7)) |
+				(uint64(b[4]) << (7 * 7))
+		case 6:
+			b := src[j : j+6 : j+6]
+			u |= (uint64(b[0]&0x7f) << (3 * 7)) | (uint64(b[1]&0x7f) << (4 * 7)) | (uint64(b[2]&0x7f) << (5 * 7)) | (uint64(b[3]&0x7f) << (6 * 7)) |
+				(uint64(b[4]&0x7f) << (7 * 7)) | (uint64(b[5]) << (8 * 7))
+		case 7:
+			b := src[j : j+7 : j+7]
+			if b[6] > 1 {
+				return src[idx:], fmt.Errorf("too big encoded varuint; src=%x", src[j-3:])
+			}
+			u |= (uint64(b[0]&0x7f) << (3 * 7)) | (uint64(b[1]&0x7f) << (4 * 7)) | (uint64(b[2]&0x7f) << (5 * 7)) | (uint64(b[3]&0x7f) << (6 * 7)) |
+				(uint64(b[4]&0x7f) << (7 * 7)) | (uint64(b[5]&0x7f) << (8 * 7)) | (1 << (9 * 7))
+		default:
+			return src[idx:], fmt.Errorf("too long encoded varuint; the maximum allowed length is 10 bytes; got %d bytes; src=%x", idx-j+3, src[j-3:])
+		}
+
+		dst[i] = u
+	}
+	return src[idx:], nil
+}
+
+// unmarshalBytes returns unmarshaled bytes from src and the size of the unmarshaled bytes.
+//
+// Copied from github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding.
+func unmarshalBytes(src []byte) ([]byte, int) {
+	n, nSize := unmarshalVarUint64(src)
+	if nSize <= 0 {
+		return nil, 0
+	}
+	if uint64(nSize)+n > uint64(len(src)) {
+		return nil, 0
+	}
+	start := nSize
+	nSize += int(n)
+	return src[start:nSize], nSize
 }
 
 func decompressZSTD(compressed []byte) ([]byte, error) {
