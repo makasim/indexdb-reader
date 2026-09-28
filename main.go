@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/klauspost/compress/zstd"
@@ -291,7 +294,7 @@ func interpretItem(item []byte) string {
 
 func interpretMetricNameToTSID(src []byte) string {
 	// Format: MetricName (tags) + 0x02 (kvSeparator) + TSID (24 bytes)
-	sep := indexOf(src, 0x02)
+	sep := bytes.IndexByte(src, 0x02)
 	if sep < 0 {
 		return fmt.Sprintf("<no kvSeparator found: %x>", src)
 	}
@@ -360,7 +363,7 @@ func interpretDateMetricNameToTSID(src []byte) string {
 // Returns the key, value, remaining bytes, and whether a composite key was found.
 func unmarshalTag(src []byte) (key, value string, tail []byte, ok bool) {
 	// Find key (terminated by tagSeparatorChar=0x01)
-	sep := indexOf(src, 0x01)
+	sep := bytes.IndexByte(src, 0x01)
 	if sep < 0 {
 		return "", "", src, false
 	}
@@ -368,7 +371,7 @@ func unmarshalTag(src []byte) (key, value string, tail []byte, ok bool) {
 	src = src[sep+1:]
 
 	// Find value (terminated by tagSeparatorChar=0x01)
-	sep = indexOf(src, 0x01)
+	sep = bytes.IndexByte(src, 0x01)
 	if sep < 0 {
 		return "", "", src, false
 	}
@@ -402,7 +405,7 @@ func unmarshalCompositeKey(src []byte) (name, key string) {
 
 func unescapeTagValue(b []byte) []byte {
 	// escapeChar=0x00, '0'→0x00, '1'→0x01, '2'→0x02
-	if !containsByte(b, 0x00) {
+	if bytes.IndexByte(b, 0x00) < 0 {
 		return b
 	}
 	var dst []byte
@@ -427,24 +430,6 @@ func unescapeTagValue(b []byte) []byte {
 	return dst
 }
 
-func containsByte(b []byte, c byte) bool {
-	for _, x := range b {
-		if x == c {
-			return true
-		}
-	}
-	return false
-}
-
-func indexOf(b []byte, c byte) int {
-	for i, x := range b {
-		if x == c {
-			return i
-		}
-	}
-	return -1
-}
-
 // unmarshalAllTags reads a MetricName from src.
 //
 // MetricName format:
@@ -454,7 +439,7 @@ func indexOf(b []byte, c byte) int {
 //	  marshalTagValue(key) + marshalTagValue(value) — each terminated by 0x01
 func unmarshalAllTags(src []byte) string {
 	// First field is the metric group (__name__)
-	sep := indexOf(src, 0x01)
+	sep := bytes.IndexByte(src, 0x01)
 	if sep < 0 {
 		return fmt.Sprintf("<cannot find metric group: %x>", src)
 	}
@@ -475,18 +460,7 @@ func unmarshalAllTags(src []byte) string {
 	if len(tags) == 0 {
 		return metricGroup
 	}
-	return metricGroup + "{" + join(tags, ", ") + "}"
-}
-
-func join(parts []string, sep string) string {
-	result := ""
-	for i, p := range parts {
-		if i > 0 {
-			result += sep
-		}
-		result += p
-	}
-	return result
+	return metricGroup + "{" + strings.Join(tags, ", ") + "}"
 }
 
 func formatTSID(src []byte) string {
@@ -506,14 +480,7 @@ func formatDate(dateVal uint64) string {
 		return "global"
 	}
 	t := int64(dateVal) * 24 * 60 * 60
-	return fmt.Sprintf("%s (day=%d)", timeFromUnix(t), dateVal)
-}
-
-func timeFromUnix(sec int64) string {
-	return fmt.Sprintf("%04d-%02d-%02d",
-		1970+sec/(365*24*3600),             // rough year
-		(sec%(365*24*3600))/(30*24*3600)+1, // rough month
-		(sec%(30*24*3600))/(24*3600)+1)     // rough day
+	return fmt.Sprintf("%s (day=%d)", time.Unix(t, 0).UTC().Format("2006-01-02"), dateVal)
 }
 
 func interpretTagToMetricID(src []byte) string {
@@ -541,7 +508,7 @@ func interpretTagToMetricID(src []byte) string {
 		for i := 0; i < numIDs; i++ {
 			ids[i] = fmt.Sprintf("%d", binary.BigEndian.Uint64(src[i*8:]))
 		}
-		return fmt.Sprintf("%s → %d metricIDs=[%s]", tag, numIDs, join(ids, ", "))
+		return fmt.Sprintf("%s → %d metricIDs=[%s]", tag, numIDs, strings.Join(ids, ", "))
 	}
 	return fmt.Sprintf("%s → <incomplete, remaining: %x>", tag, src)
 }
