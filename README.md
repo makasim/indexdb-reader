@@ -15,6 +15,9 @@ Example:
 go run indexdb-reader/main.go ./legacy-vm-data/indexdb/18D8D04BD1AD1DC0/18D8D04BD2E00A3A/
 ```
 
+Both single-node and cluster (vmstorage) parts are supported. The version is
+detected from the part's `firstItem`, see [Cluster Version](#cluster-version).
+
 ## IndexDB Directory Structure
 
 ```
@@ -144,6 +147,11 @@ Each decoded item starts with a namespace byte that determines its format:
 | `0x06` | DateTag → MetricIDs | Per-day version of Tag → MetricIDs |
 | `0x07` | DateMetricName → TSID | Per-day version of MetricName → TSID |
 
+`0x00` entries are written only when VictoriaMetrics runs with
+`-disablePerDayIndex`. By default, `0x07` (per-day) is used instead, since a
+global MetricName → TSID index needs a lot of cache memory under high churn.
+In that mode `0x05`-`0x07` are not written.
+
 ### TSID (24 bytes)
 
 ```
@@ -195,3 +203,64 @@ For a metric with N tags, the index stores:
 
 Global (prefixes `0x00`-`0x04`) and per-day (prefixes `0x05`-`0x07`) indexes
 store the same metricID/TSID values.
+
+## Cluster Version
+
+The cluster version (vmstorage) uses the same on-disk layers and namespace
+bytes. Only item contents differ: they carry the tenant,
+`Uint32(AccountID) + Uint32(ProjectID)` (8 bytes, big-endian).
+
+| Byte | single-node | cluster |
+|------|-------------|---------|
+| `0x00` | `0x00` MetricName `0x02` TSID | `0x00` **tenant**+MetricName `0x02` TSID |
+| `0x01` | `0x01` tag metricIDs... | `0x01` **tenant** tag metricIDs... |
+| `0x02` | `0x02` metricID TSID | `0x02` **tenant** metricID TSID |
+| `0x03` | `0x03` metricID MetricName | `0x03` **tenant** metricID **tenant**+MetricName |
+| `0x04` | `0x04` metricID | same, no tenant (deleted metricIDs are global) |
+| `0x05` | `0x05` date metricID | `0x05` **tenant** date metricID |
+| `0x06` | `0x06` date tag metricIDs... | `0x06` **tenant** date tag metricIDs... |
+| `0x07` | `0x07` date MetricName `0x02` TSID | `0x07` date **tenant**+MetricName `0x02` TSID |
+
+Notes:
+- In `0x00` and `0x07` the tenant is not a separate prefix; it is the beginning
+  of the marshaled MetricName. So in `0x07` it comes **after** the date.
+- In `0x03` the tenant is stored twice: in the prefix and inside MetricName.
+- Items are sorted by tenant first, so all items of one tenant are adjacent.
+
+### Cluster TSID (32 bytes)
+
+```
+AccountID       uint32   (4 bytes, big-endian)
+ProjectID       uint32   (4 bytes, big-endian)
+MetricGroupID   uint64   (8 bytes, big-endian)
+JobID           uint32   (4 bytes, big-endian)
+InstanceID      uint32   (4 bytes, big-endian)
+MetricID        uint64   (8 bytes, big-endian)
+```
+
+Since the tenant at the start of MetricName is raw bytes (it may contain
+`0x02`), the `0x02` separator before the TSID must be located from the end:
+it is always at `len-25` (single-node) or `len-33` (cluster).
+
+### Version Detection
+
+All parts within a directory are of the same version. The reader decides by
+the part's `firstItem` from `metadata.json`:
+
+| firstItem | single-node | cluster | certain? |
+|-----------|-------------|---------|----------|
+| `0x00` | `item[len-25] == 0x02` | `item[len-33] == 0x02` | yes |
+| `0x02` | 33 bytes | 49 bytes | yes |
+| `0x05` | 17 bytes | 25 bytes | yes |
+| `0x07` | `item[len-25] == 0x02` | `len >= 42` and `item[len-33] == 0x02` | yes |
+| `0x01` | anything else | `item[1] == 0x00` and `item[2]` not `'0'`-`'2'` | assumes AccountID < 65536 |
+
+The rules rely on escaping: single-node never has a raw `0x02` inside a metric
+name, and an escaped `0x00` is always followed by `'0'`, `'1'` or `'2'`. In
+cluster, `item[1:3]` of a `0x01` item are the high bytes of AccountID, which are
+`00 00` for AccountID < 65536.
+
+`0x03`, `0x04` and `0x06` cannot be used: `0x04` is the same in both versions,
+and in `0x03`/`0x06` the tenant cannot be told apart from a metricID or a date.
+In practice `firstItem` is `0x01` (sometimes `0x05`) with the default per-day
+index, and `0x00` with `-disablePerDayIndex`.

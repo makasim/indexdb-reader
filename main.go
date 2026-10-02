@@ -47,6 +47,14 @@ func main() {
 	fmt.Printf("  firstItem (%d bytes): %x\n", len(firstItem), firstItem)
 	fmt.Printf("  lastItem  (%d bytes): %x\n", len(lastItem), lastItem)
 
+	// The on-disk layers are the same for single-node and cluster, only the item
+	// contents differ, so the decoder is picked once here by firstItem.
+	dec, err := detectItemDecoder(firstItem)
+	if err != nil {
+		fatalf("detect version: %v", err)
+	}
+	fmt.Printf("  version: %s\n", dec.Name())
+
 	// --- Step 2: Read and decompress metaindex.bin ---
 	//
 	// metaindex.bin is ZSTD-compressed. After decompression it contains
@@ -235,13 +243,99 @@ func main() {
 			fmt.Printf("      --- decoded %d items ---\n", len(items))
 			for i, item := range items {
 				fmt.Printf("      item[%02d] (%3d bytes): %x\n", i, len(item), item)
-				fmt.Printf("               %s\n", interpretItem(item))
+				fmt.Printf("               %s\n", interpretItem(dec, item))
 			}
 		}
 		if len(bhSrc) > 0 {
 			fatalf("unexpected %d trailing bytes in index block", len(bhSrc))
 		}
 	}
+}
+
+// detectItemDecoder returns the decoder for the version (single-node or cluster)
+// the part was written by, judging by its firstItem.
+//
+// With the default per-day index the smallest items are 0x01 (Tag → MetricIDs),
+// sometimes 0x05 (Date → MetricID); with -disablePerDayIndex they are 0x00 (MetricName → TSID).
+//
+// Single-node escapes tag keys, values and metric names: 0x00 is always followed
+// by '0', '1' or '2', and raw 0x01/0x02 are used only as separators.
+//
+// 0x00, 0x02, 0x05 and 0x07 are detected with certainty; 0x01 assumes AccountID < 65536.
+// 0x03, 0x04 and 0x06 are not supported: 0x04 is the same in both versions, and in 0x03
+// and 0x06 the tenant cannot be told apart from a metricID or a date.
+func detectItemDecoder(firstItem []byte) (itemDecoder, error) {
+	item := firstItem
+	n := len(item)
+	if n == 0 {
+		return nil, fmt.Errorf("empty firstItem")
+	}
+
+	switch item[0] {
+	case 0x00:
+		// cluster:     0x00 + AccountID(4) + ProjectID(4) + MetricName + 0x02 + TSID (32 bytes)
+		// single-node: 0x00 + MetricName + 0x02 + TSID (24 bytes)
+		//
+		// In cluster item[n-33] is always the 0x02 separator. In single-node it
+		// is inside the escaped MetricName, which never contains a raw 0x02.
+		switch {
+		case n >= 1+32 && item[n-33] == 0x02:
+			return clusterItemDecoder{}, nil
+		case n >= 1+24 && item[n-25] == 0x02:
+			return singleItemDecoder{}, nil
+		}
+	case 0x01:
+		// cluster:     0x01 + AccountID(4) + ProjectID(4) + tagKey\x01 tagValue\x01 metricIDs
+		// single-node: 0x01 + tagKey\x01 tagValue\x01 metricIDs
+		//
+		// Assumes AccountID < 65536.
+		// 0x00 followed by anything but '0', '1' or '2' cannot start an escaped tag key,
+		// so it is the high bytes of AccountID (00 00 for AccountID < 65536).
+		// Anything else that is a valid start of an escaped tag key is single-node.
+		if n < 3 {
+			break
+		}
+		switch {
+		case item[1] == 0x00 && (item[2] < '0' || item[2] > '2'):
+			return clusterItemDecoder{}, nil
+		case item[1] != 0x02:
+			return singleItemDecoder{}, nil
+		}
+	case 0x02:
+		// cluster:     0x02 + AccountID(4) + ProjectID(4) + metricID(8) + TSID (32 bytes) = 49 bytes
+		// single-node: 0x02 + metricID(8) + TSID (24 bytes) = 33 bytes
+		switch n {
+		case 49:
+			return clusterItemDecoder{}, nil
+		case 33:
+			return singleItemDecoder{}, nil
+		}
+	case 0x05:
+		// cluster:     0x05 + AccountID(4) + ProjectID(4) + date(8) + metricID(8) = 25 bytes
+		// single-node: 0x05 + date(8) + metricID(8) = 17 bytes
+		switch n {
+		case 25:
+			return clusterItemDecoder{}, nil
+		case 17:
+			return singleItemDecoder{}, nil
+		}
+	case 0x07:
+		// cluster:     0x07 + date(8) + AccountID(4) + ProjectID(4) + MetricName + 0x02 + TSID (32 bytes)
+		// single-node: 0x07 + date(8) + MetricName + 0x02 + TSID (24 bytes)
+		//
+		// Same as 0x00, except that in single-node item[n-33] is inside the escaped
+		// MetricName only if n >= 42; for shorter items it may hit the date.
+		// Shorter items can only be single-node, since cluster ones are at least 52 bytes.
+		switch {
+		case n >= 42 && item[n-33] == 0x02:
+			return clusterItemDecoder{}, nil
+		case n >= 1+8+24 && item[n-25] == 0x02:
+			return singleItemDecoder{}, nil
+		}
+	default:
+		return nil, fmt.Errorf("cannot detect version by firstItem with nsPrefix=0x%02x: %x", item[0], item)
+	}
+	return nil, fmt.Errorf("firstItem matches neither single-node nor cluster layout: %x", item)
 }
 
 // interpretItem decodes a raw indexdb item into a human-readable string.
@@ -261,8 +355,10 @@ func main() {
 // An empty tagKey means __name__ (the metric name itself).
 // A tagKey starting with 0xFE is a composite key: 0xFE + VarUint64(nameLen) + metricName + tagKey.
 // MetricIDs and dates are 8-byte big-endian uint64.
-// TSID is 24 bytes: MetricGroupID(8) + JobID(4) + InstanceID(4) + MetricID(8).
-func interpretItem(item []byte) string {
+//
+// The nsPrefix values are the same for single-node and cluster versions,
+// but the bytes after nsPrefix differ, so they are decoded by dec.
+func interpretItem(dec itemDecoder, item []byte) string {
 	if len(item) == 0 {
 		return "<empty>"
 	}
@@ -271,53 +367,216 @@ func interpretItem(item []byte) string {
 
 	switch nsPrefix {
 	case 0x00: // MetricName → TSID
-		return "MetricName→TSID: " + interpretMetricNameToTSID(rest)
+		return "MetricName→TSID: " + dec.MetricNameToTSID(rest)
 	case 0x01: // Tag → MetricID
-		return "Tag→MetricID: " + interpretTagToMetricID(rest)
+		return "Tag→MetricID: " + dec.TagToMetricIDs(rest)
 	case 0x02: // MetricID → TSID
-		return "MetricID→TSID: " + interpretMetricIDToTSID(rest)
+		return "MetricID→TSID: " + dec.MetricIDToTSID(rest)
 	case 0x03: // MetricID → MetricName
-		return "MetricID→MetricName: " + interpretMetricIDToMetricName(rest)
+		return "MetricID→MetricName: " + dec.MetricIDToMetricName(rest)
 	case 0x04: // Deleted MetricID
-		return "DeletedMetricID: " + interpretDeletedMetricID(rest)
+		return "DeletedMetricID: " + dec.DeletedMetricID(rest)
 	case 0x05: // Date → MetricID
-		return "Date→MetricID: " + interpretDateToMetricID(rest)
+		return "Date→MetricID: " + dec.DateToMetricID(rest)
 	case 0x06: // (Date,Tag) → MetricID
-		return "DateTag→MetricID: " + interpretDateTagToMetricID(rest)
+		return "DateTag→MetricID: " + dec.DateTagToMetricIDs(rest)
 	case 0x07: // (Date,MetricName) → TSID
-		return "DateMetricName→TSID: " + interpretDateMetricNameToTSID(rest)
+		return "DateMetricName→TSID: " + dec.DateMetricNameToTSID(rest)
 	default:
 		return fmt.Sprintf("<unknown nsPrefix=0x%02x>", nsPrefix)
 	}
 }
 
-func interpretMetricNameToTSID(src []byte) string {
+// itemDecoder decodes an indexdb item after its nsPrefix byte.
+// It panics if the bytes do not match the expected layout.
+type itemDecoder interface {
+	Name() string
+
+	MetricNameToTSID(src []byte) string     // 0x00
+	TagToMetricIDs(src []byte) string       // 0x01
+	MetricIDToTSID(src []byte) string       // 0x02
+	MetricIDToMetricName(src []byte) string // 0x03
+	DeletedMetricID(src []byte) string      // 0x04
+	DateToMetricID(src []byte) string       // 0x05
+	DateTagToMetricIDs(src []byte) string   // 0x06
+	DateMetricNameToTSID(src []byte) string // 0x07
+}
+
+// singleItemDecoder decodes items written by the single-node version.
+//
+// TSID is 24 bytes: MetricGroupID(8) + JobID(4) + InstanceID(4) + MetricID(8).
+type singleItemDecoder struct{}
+
+func (singleItemDecoder) Name() string { return "single-node" }
+
+func (d singleItemDecoder) MetricNameToTSID(src []byte) string {
 	// Format: MetricName (tags) + 0x02 (kvSeparator) + TSID (24 bytes)
-	sep := bytes.IndexByte(src, 0x02)
-	if sep < 0 {
-		return fmt.Sprintf("<no kvSeparator found: %x>", src)
-	}
-	metricName := unmarshalAllTags(src[:sep])
-	tsid := formatTSID(src[sep+1:])
-	return fmt.Sprintf("%s → %s", metricName, tsid)
+	metricName, tsid := cutTSID(src, 24)
+	return fmt.Sprintf("%s → %s", unmarshalAllTags(metricName), d.formatTSID(tsid))
 }
 
-func interpretMetricIDToTSID(src []byte) string {
-	if len(src) < 8 {
-		return fmt.Sprintf("<need 8 bytes for metricID, got %d>", len(src))
-	}
-	metricID := binary.BigEndian.Uint64(src[:8])
-	tsid := formatTSID(src[8:])
-	return fmt.Sprintf("metricID=%d → %s", metricID, tsid)
+func (singleItemDecoder) TagToMetricIDs(src []byte) string {
+	return interpretTagToMetricID(src)
 }
 
-func interpretMetricIDToMetricName(src []byte) string {
-	if len(src) < 8 {
-		return fmt.Sprintf("<need 8 bytes for metricID, got %d>", len(src))
-	}
+func (d singleItemDecoder) MetricIDToTSID(src []byte) string {
+	// Format: metricID (8 bytes) + TSID (24 bytes)
+	mustLen(src, 8+24, "metricID + TSID")
 	metricID := binary.BigEndian.Uint64(src[:8])
-	metricName := unmarshalAllTags(src[8:])
-	return fmt.Sprintf("metricID=%d → %s", metricID, metricName)
+	return fmt.Sprintf("metricID=%d → %s", metricID, d.formatTSID(src[8:]))
+}
+
+func (singleItemDecoder) MetricIDToMetricName(src []byte) string {
+	// Format: metricID (8 bytes) + MetricName (tags)
+	mustMinLen(src, 8, "metricID")
+	metricID := binary.BigEndian.Uint64(src[:8])
+	return fmt.Sprintf("metricID=%d → %s", metricID, unmarshalAllTags(src[8:]))
+}
+
+func (singleItemDecoder) DeletedMetricID(src []byte) string {
+	return interpretDeletedMetricID(src)
+}
+
+func (singleItemDecoder) DateToMetricID(src []byte) string {
+	return interpretDateToMetricID(src)
+}
+
+func (singleItemDecoder) DateTagToMetricIDs(src []byte) string {
+	return interpretDateTagToMetricID(src)
+}
+
+func (d singleItemDecoder) DateMetricNameToTSID(src []byte) string {
+	// Format: date (8 bytes) + MetricName (tags) + 0x02 (kvSeparator) + TSID (24 bytes)
+	mustMinLen(src, 8, "date")
+	date := binary.BigEndian.Uint64(src[:8])
+	return fmt.Sprintf("date=%s, %s", formatDate(date), d.MetricNameToTSID(src[8:]))
+}
+
+func (singleItemDecoder) formatTSID(src []byte) string {
+	mustLen(src, 24, "TSID")
+	metricGroupID := binary.BigEndian.Uint64(src[0:8])
+	jobID := binary.BigEndian.Uint32(src[8:12])
+	instanceID := binary.BigEndian.Uint32(src[12:16])
+	metricID := binary.BigEndian.Uint64(src[16:24])
+	return fmt.Sprintf("TSID{metricGroupID=%d, jobID=%d, instanceID=%d, metricID=%d}", metricGroupID, jobID, instanceID, metricID)
+}
+
+// clusterItemDecoder decodes items written by the cluster version (vmstorage).
+//
+// The cluster version adds tenant IDs: Uint32(AccountID) + Uint32(ProjectID).
+//
+//	0x01, 0x02, 0x03, 0x05, 0x06 — tenant goes right after nsPrefix
+//	0x00, 0x07 — no tenant after nsPrefix; it is the beginning of MetricName
+//	instead, so for 0x07 it comes AFTER the date
+//	0x04 — no tenant at all; deleted metricIDs are global
+//
+// Once the tenant is cut, 0x01, 0x04, 0x05 and 0x06 are the same as in single-node.
+//
+// MetricName starts with the tenant: AccountID(4) + ProjectID(4) + tags.
+// TSID is 32 bytes: AccountID(4) + ProjectID(4) + MetricGroupID(8) + JobID(4) + InstanceID(4) + MetricID(8).
+type clusterItemDecoder struct{}
+
+func (clusterItemDecoder) Name() string { return "cluster" }
+
+func (d clusterItemDecoder) MetricNameToTSID(src []byte) string {
+	// Format: MetricName (tenant + tags) + 0x02 (kvSeparator) + TSID (32 bytes)
+	metricName, tsid := cutTSID(src, 32)
+	return fmt.Sprintf("%s → %s", d.formatMetricName(metricName), d.formatTSID(tsid))
+}
+
+func (clusterItemDecoder) TagToMetricIDs(src []byte) string {
+	tenant, src := cutTenant(src)
+	return tenant + ", " + interpretTagToMetricID(src)
+}
+
+func (d clusterItemDecoder) MetricIDToTSID(src []byte) string {
+	// Format: tenant (8 bytes) + metricID (8 bytes) + TSID (32 bytes)
+	tenant, src := cutTenant(src)
+	mustLen(src, 8+32, "metricID + TSID")
+	metricID := binary.BigEndian.Uint64(src[:8])
+	return fmt.Sprintf("%s, metricID=%d → %s", tenant, metricID, d.formatTSID(src[8:]))
+}
+
+func (d clusterItemDecoder) MetricIDToMetricName(src []byte) string {
+	// Format: tenant (8 bytes) + metricID (8 bytes) + MetricName (tenant + tags)
+	//
+	// The tenant is stored twice: in the item prefix and inside MetricName.
+	tenant, src := cutTenant(src)
+	mustMinLen(src, 8, "metricID")
+	metricID := binary.BigEndian.Uint64(src[:8])
+	return fmt.Sprintf("%s, metricID=%d → %s", tenant, metricID, d.formatMetricName(src[8:]))
+}
+
+func (clusterItemDecoder) DeletedMetricID(src []byte) string {
+	return interpretDeletedMetricID(src)
+}
+
+func (clusterItemDecoder) DateToMetricID(src []byte) string {
+	tenant, src := cutTenant(src)
+	return tenant + ", " + interpretDateToMetricID(src)
+}
+
+func (clusterItemDecoder) DateTagToMetricIDs(src []byte) string {
+	tenant, src := cutTenant(src)
+	return tenant + ", " + interpretDateTagToMetricID(src)
+}
+
+func (d clusterItemDecoder) DateMetricNameToTSID(src []byte) string {
+	// Format: date (8 bytes) + MetricName (tenant + tags) + 0x02 (kvSeparator) + TSID (32 bytes)
+	mustMinLen(src, 8, "date")
+	date := binary.BigEndian.Uint64(src[:8])
+	return fmt.Sprintf("date=%s, %s", formatDate(date), d.MetricNameToTSID(src[8:]))
+}
+
+func (clusterItemDecoder) formatMetricName(src []byte) string {
+	tenant, src := cutTenant(src)
+	return tenant + " " + unmarshalAllTags(src)
+}
+
+func (clusterItemDecoder) formatTSID(src []byte) string {
+	mustLen(src, 32, "TSID")
+	accountID := binary.BigEndian.Uint32(src[0:4])
+	projectID := binary.BigEndian.Uint32(src[4:8])
+	metricGroupID := binary.BigEndian.Uint64(src[8:16])
+	jobID := binary.BigEndian.Uint32(src[16:20])
+	instanceID := binary.BigEndian.Uint32(src[20:24])
+	metricID := binary.BigEndian.Uint64(src[24:32])
+	return fmt.Sprintf("TSID{accountID=%d, projectID=%d, metricGroupID=%d, jobID=%d, instanceID=%d, metricID=%d}",
+		accountID, projectID, metricGroupID, jobID, instanceID, metricID)
+}
+
+// cutTenant reads Uint32(AccountID) + Uint32(ProjectID) from src
+// and returns the formatted tenant and the remaining bytes.
+func cutTenant(src []byte) (string, []byte) {
+	mustMinLen(src, 8, "tenant")
+	accountID := binary.BigEndian.Uint32(src[0:4])
+	projectID := binary.BigEndian.Uint32(src[4:8])
+	return fmt.Sprintf("tenant=%d:%d", accountID, projectID), src[8:]
+}
+
+// cutTSID splits src into MetricName and TSID of the given size.
+//
+// The separator is located from the end, since TSID has a fixed size.
+// Searching it from the start is unsafe in cluster version,
+// since the tenant at the beginning of MetricName is raw bytes and can contain 0x02.
+func cutTSID(src []byte, tsidSize int) (metricName, tsid []byte) {
+	sep := len(src) - 1 - tsidSize
+	if sep < 0 || src[sep] != 0x02 {
+		panic(fmt.Sprintf("no kvSeparator (0x02) before %d-byte TSID: %x", tsidSize, src))
+	}
+	return src[:sep], src[sep+1:]
+}
+
+func mustLen(src []byte, n int, what string) {
+	if len(src) != n {
+		panic(fmt.Sprintf("%s: want %d bytes, got %d: %x", what, n, len(src), src))
+	}
+}
+
+func mustMinLen(src []byte, n int, what string) {
+	if len(src) < n {
+		panic(fmt.Sprintf("%s: want at least %d bytes, got %d: %x", what, n, len(src), src))
+	}
 }
 
 func interpretDeletedMetricID(src []byte) string {
@@ -345,16 +604,6 @@ func interpretDateTagToMetricID(src []byte) string {
 	rest := src[8:]
 	tagStr := interpretTagToMetricID(rest)
 	return fmt.Sprintf("date=%s, %s", formatDate(date), tagStr)
-}
-
-func interpretDateMetricNameToTSID(src []byte) string {
-	if len(src) < 8 {
-		return fmt.Sprintf("<need 8 bytes for date, got %d>", len(src))
-	}
-	date := binary.BigEndian.Uint64(src[:8])
-	rest := src[8:]
-	mnToTSID := interpretMetricNameToTSID(rest)
-	return fmt.Sprintf("date=%s, %s", formatDate(date), mnToTSID)
 }
 
 // unmarshalTag reads one tag (key + value) from src.
@@ -460,17 +709,6 @@ func unmarshalAllTags(src []byte) string {
 		return metricGroup
 	}
 	return metricGroup + "{" + strings.Join(tags, ", ") + "}"
-}
-
-func formatTSID(src []byte) string {
-	if len(src) < 24 {
-		return fmt.Sprintf("<bad TSID: %d bytes>", len(src))
-	}
-	metricGroupID := binary.BigEndian.Uint64(src[0:8])
-	jobID := binary.BigEndian.Uint32(src[8:12])
-	instanceID := binary.BigEndian.Uint32(src[12:16])
-	metricID := binary.BigEndian.Uint64(src[16:24])
-	return fmt.Sprintf("TSID{metricGroupID=%d, jobID=%d, instanceID=%d, metricID=%d}", metricGroupID, jobID, instanceID, metricID)
 }
 
 func formatDate(dateVal uint64) string {
